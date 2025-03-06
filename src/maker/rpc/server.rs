@@ -12,7 +12,7 @@ use super::messages::RpcMsgReq;
 use crate::{
     maker::{error::MakerError, rpc::messages::RpcMsgResp, Maker},
     utill::{get_tor_hostname, read_message, send_message, ConnectionType, HEART_BEAT_INTERVAL},
-    wallet::{Destination, SendAmount},
+    wallet::Destination,
 };
 use std::str::FromStr;
 
@@ -27,7 +27,7 @@ fn handle_request(maker: &Arc<Maker>, socket: &mut TcpStream) -> Result<(), Make
             let utxos = maker
                 .get_wallet()
                 .read()?
-                .list_live_contract_spend_info(None)?
+                .list_live_timelock_contract_spend_info(None)?
                 .iter()
                 .map(|(l, _)| l.clone())
                 .collect::<Vec<_>>();
@@ -57,27 +57,15 @@ fn handle_request(maker: &Arc<Maker>, socket: &mut TcpStream) -> Result<(), Make
             let utxos = maker
                 .get_wallet()
                 .read()?
-                .list_swap_coin_utxo_spend_info(None)?
+                .list_incoming_swap_coin_utxo_spend_info(None)?
                 .iter()
                 .map(|(l, _)| l.clone())
                 .collect::<Vec<_>>();
             RpcMsgResp::SwapUtxoResp { utxos }
         }
-        RpcMsgReq::ContractBalance => {
-            let balance = maker.get_wallet().read()?.balance_live_contract(None)?;
-            RpcMsgResp::ContractBalanceResp(balance.to_sat())
-        }
-        RpcMsgReq::FidelityBalance => {
-            let balance = maker.get_wallet().read()?.balance_fidelity_bonds(None)?;
-            RpcMsgResp::FidelityBalanceResp(balance.to_sat())
-        }
-        RpcMsgReq::Balance => {
-            let balance = maker.get_wallet().read()?.spendable_balance()?;
-            RpcMsgResp::SeedBalanceResp(balance.to_sat())
-        }
-        RpcMsgReq::SwapBalance => {
-            let balance = maker.get_wallet().read()?.balance_swap_coins(None)?;
-            RpcMsgResp::SwapBalanceResp(balance.to_sat())
+        RpcMsgReq::Balances => {
+            let balances = maker.get_wallet().read()?.get_balances(None)?;
+            RpcMsgResp::TotalBalanceResp(balances)
         }
         RpcMsgReq::NewAddress => {
             let new_address = maker.get_wallet().write()?.get_next_external_address()?;
@@ -86,26 +74,25 @@ fn handle_request(maker: &Arc<Maker>, socket: &mut TcpStream) -> Result<(), Make
         RpcMsgReq::SendToAddress {
             address,
             amount,
-            fee,
+            feerate,
         } => {
             let amount = Amount::from_sat(amount);
-            let fee = Amount::from_sat(fee);
-            let destination =
-                Destination::Address(Address::from_str(&address).unwrap().assume_checked());
+            let destination = Destination::Multi(vec![(
+                Address::from_str(&address).unwrap().assume_checked(),
+                amount,
+            )]);
 
-            let coins_to_send = maker.get_wallet().read()?.coin_select(amount + fee)?;
+            let coins_to_send = maker.get_wallet().read()?.coin_select(amount)?;
 
             let tx = maker.get_wallet().write()?.spend_from_wallet(
-                fee,
-                SendAmount::Amount(amount),
+                feerate,
                 destination,
                 &coins_to_send,
             )?;
 
-            let calculated_fee_rate = fee / (tx.weight());
-            log::info!("Calculated FeeRate : {:#}", calculated_fee_rate);
-
             let txid = maker.get_wallet().read()?.send_tx(&tx)?;
+
+            maker.get_wallet().write()?.sync_no_fail();
 
             RpcMsgResp::SendToAddressResp(txid.to_string())
         }
@@ -117,10 +104,8 @@ fn handle_request(maker: &Arc<Maker>, socket: &mut TcpStream) -> Result<(), Make
             if maker.config.connection_type == ConnectionType::CLEARNET {
                 RpcMsgResp::GetTorAddressResp("Maker is not running on TOR".to_string())
             } else {
-                let hostname = get_tor_hostname(&maker.data_dir.join("tor"))?;
-
+                let hostname = get_tor_hostname()?;
                 let address = format!("{}:{}", hostname, maker.config.network_port);
-
                 RpcMsgResp::GetTorAddressResp(address)
             }
         }
@@ -129,19 +114,17 @@ fn handle_request(maker: &Arc<Maker>, socket: &mut TcpStream) -> Result<(), Make
             RpcMsgResp::Shutdown
         }
 
-        RpcMsgReq::RedeemFidelity(index) => {
-            let txid = maker.get_wallet().write()?.redeem_fidelity(index)?;
+        RpcMsgReq::RedeemFidelity { index, feerate } => {
+            let txid = maker
+                .get_wallet()
+                .write()?
+                .redeem_fidelity(index, feerate)?;
+
+            maker.get_wallet().write()?.sync_no_fail();
             RpcMsgResp::FidelitySpend(txid)
         }
         RpcMsgReq::ListFidelity => {
-            let list = maker
-                .get_wallet()
-                .read()?
-                .get_fidelity_bonds()
-                .iter()
-                .map(|(i, (b, _, is_spent))| (*i, (b.clone(), *is_spent)))
-                .collect();
-
+            let list = maker.get_wallet().read()?.display_fidelity_bonds()?;
             RpcMsgResp::ListBonds(list)
         }
         RpcMsgReq::SyncWallet => {

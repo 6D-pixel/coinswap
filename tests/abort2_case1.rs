@@ -4,11 +4,11 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use coinswap::{
     maker::{start_maker_server, MakerBehavior},
     taker::{SwapParams, TakerBehavior},
-    utill::ConnectionType,
+    utill::{ConnectionType, DEFAULT_TX_FEE_RATE},
 };
 use std::sync::Arc;
 mod test_framework;
-use coinswap::wallet::{Destination, SendAmount};
+use coinswap::wallet::Destination;
 use log::{info, warn};
 use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
 use test_framework::*;
@@ -86,20 +86,14 @@ fn test_abort_case_2_move_on_with_other_makers() {
             let wallet = maker.wallet.read().unwrap();
             let all_utxos = wallet.get_all_utxo().unwrap();
 
-            let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
+            let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
-            let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
+            assert_eq!(balances.regular, Amount::from_btc(0.14999).unwrap());
+            assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
+            assert_eq!(balances.swap, Amount::ZERO);
+            assert_eq!(balances.contract, Amount::ZERO);
 
-            let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-
-            let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
-
-            assert_eq!(seed_balance, Amount::from_btc(0.14999).unwrap());
-            assert_eq!(fidelity_balance, Amount::from_btc(0.05).unwrap());
-            assert_eq!(swapcoin_balance, Amount::ZERO);
-            assert_eq!(live_contract_balance, Amount::ZERO);
-
-            seed_balance + swapcoin_balance
+            balances.spendable
         })
         .collect::<Vec<_>>();
 
@@ -198,16 +192,13 @@ fn test_abort_case_2_move_on_with_other_makers() {
     let taker_wallet_mut = taker.get_wallet_mut();
 
     let swap_coins = taker_wallet_mut
-        .list_swap_coin_utxo_spend_info(None)
+        .list_incoming_swap_coin_utxo_spend_info(None)
         .unwrap();
 
+    let addr = taker_wallet_mut.get_next_internal_addresses(1).unwrap()[0].to_owned();
+
     let tx = taker_wallet_mut
-        .spend_from_wallet(
-            Amount::from_sat(1000),
-            SendAmount::Max,
-            Destination::Wallet,
-            &swap_coins,
-        )
+        .spend_from_wallet(DEFAULT_TX_FEE_RATE, Destination::Sweep(addr), &swap_coins)
         .unwrap();
 
     assert_eq!(
@@ -221,11 +212,10 @@ fn test_abort_case_2_move_on_with_other_makers() {
 
     taker_wallet_mut.sync().unwrap();
 
-    let swap_coin_bal = taker_wallet_mut.balance_swap_coins(None).unwrap();
-    let descriptor_bal = taker_wallet_mut.balance_descriptor_utxo(None).unwrap();
+    let balances = taker_wallet_mut.get_balances(None).unwrap();
 
-    assert_eq!(swap_coin_bal, Amount::ZERO);
-    assert_eq!(descriptor_bal, Amount::from_btc(0.14934642).unwrap());
+    assert_eq!(balances.swap, Amount::ZERO);
+    assert_eq!(balances.regular, Amount::from_btc(0.14934642).unwrap());
 
     info!("All checks successful. Terminating integration test case");
 

@@ -1,14 +1,17 @@
 use bitcoin::{Address, Amount};
-use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, Auth};
+use bitcoind::bitcoincore_rpc::Auth;
 use clap::Parser;
 use coinswap::{
     taker::{error::TakerError, SwapParams, Taker, TakerBehavior},
-    utill::{parse_proxy_auth, setup_taker_logger, ConnectionType, REQUIRED_CONFIRMS},
-    wallet::{Destination, RPCConfig, SendAmount},
+    utill::{
+        parse_proxy_auth, setup_taker_logger, ConnectionType, DEFAULT_TX_FEE_RATE,
+        REQUIRED_CONFIRMS, UTXO,
+    },
+    wallet::{Destination, RPCConfig},
 };
 use log::LevelFilter;
+use serde_json::{json, to_string_pretty};
 use std::{path::PathBuf, str::FromStr};
-
 /// A simple command line app to operate as coinswap client.
 ///
 /// The app works as regular Bitcoin wallet with added capability to perform coinswaps. The app
@@ -55,18 +58,20 @@ struct Cli {
 #[derive(Parser, Debug)]
 enum Commands {
     // TODO: Design a better structure to display different utxos and balance groups.
-    /// Lists all currently spendable utxos
+    /// Lists all utxos we know about along with their spend info. This is useful for debugging
     ListUtxo,
+    /// List all signle signature wallet Utxos. These are all non-swap regular wallet utxos.
+    ListUtxoRegular,
     /// Lists all utxos received in incoming swaps
     ListUtxoSwap,
-    /// Lists all HTLC utxos (if any)
+    /// Lists all utxos that we need to claim via timelock. If you see entries in this list, do a `taker recover` to claim them.
     ListUtxoContract,
-    /// Get the total spendable wallet balance (sats)
-    GetBalance,
-    /// Get the total balance received from swaps (sats)
-    GetBalanceSwap,
-    /// Get the total amount stuck in HTLC contracts (sats)
-    GetBalanceContract,
+    /// Get total wallet balances of different categories.
+    /// regular: All single signature regular wallet coins (seed balance).
+    /// swap: All 2of2 multisig coins received in swaps.
+    /// contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with recover command.
+    /// spendable: Spendable amount in wallet (regular + swap balance).
+    GetBalances,
     /// Returns a new address
     GetNewAddress,
     /// Send to an external wallet address.
@@ -77,9 +82,9 @@ enum Commands {
         /// Amount to send in sats
         #[clap(long, short = 'a')]
         amount: u64,
-        /// Mining fee to be paid in sats
+        /// Feerate in sats/vByte. Defaults to 2 sats/vByte
         #[clap(long, short = 'f')]
-        fee: u64,
+        feerate: Option<f64>,
     },
     /// Update the offerbook with current market offers and display them
     FetchOffers,
@@ -87,8 +92,8 @@ enum Commands {
     // TODO: Also add ListOffers command to just list the current book.
     /// Initiate the coinswap process
     Coinswap {
-        /// Sets the maker count to swap with. Swapping with less than 2 makers is allowed to maintain client privacy.
-        /// Adding more makers in the swap will incure more swap fees.
+        /// Sets the maker count to swap with. Swapping with less than 2 makers is not allowed to maintain client privacy.
+        /// Adding more makers in the swap will incur more swap fees.
         #[clap(long, short = 'm', default_value = "2")]
         makers: usize,
         /// Sets the swap amount in sats.
@@ -105,7 +110,14 @@ enum Commands {
 
 fn main() -> Result<(), TakerError> {
     let args = Cli::parse();
-    setup_taker_logger(LevelFilter::from_str(&args.verbosity).unwrap());
+    setup_taker_logger(
+        LevelFilter::from_str(&args.verbosity).unwrap(),
+        matches!(
+            args.command,
+            Commands::Recover | Commands::FetchOffers | Commands::Coinswap { .. }
+        ),
+        args.data_directory.clone(), //default path handled inside the function.
+    );
 
     let rpc_config = RPCConfig {
         url: args.rpc,
@@ -113,14 +125,10 @@ fn main() -> Result<(), TakerError> {
         wallet_name: "random".to_string(), // we can put anything here as it will get updated in the init.
     };
 
-    #[cfg(feature = "tor")]
-    let connection_type = if cfg!(feature = "integration-test") {
-        ConnectionType::CLEARNET
-    } else {
-        ConnectionType::TOR
-    };
+    #[cfg(not(feature = "integration-test"))]
+    let connection_type = ConnectionType::TOR;
 
-    #[cfg(not(feature = "tor"))]
+    #[cfg(feature = "integration-test")]
     let connection_type = ConnectionType::CLEARNET;
 
     let mut taker = Taker::init(
@@ -128,48 +136,56 @@ fn main() -> Result<(), TakerError> {
         args.wallet_name.clone(),
         Some(rpc_config.clone()),
         TakerBehavior::Normal,
+        None,
+        None,
         Some(connection_type),
     )?;
 
     match args.command {
         Commands::ListUtxo => {
-            let utxos: Vec<ListUnspentResultEntry> = taker
-                .get_wallet()
-                .list_all_utxo_spend_info(None)?
-                .iter()
-                .map(|(l, _)| l.clone())
-                .collect();
-            println!("{:#?}", utxos);
+            let utxos = taker.get_wallet().list_all_utxo_spend_info(None)?;
+            for utxo in utxos {
+                let utxo = UTXO::from_utxo_data(utxo);
+                println!("{}", serde_json::to_string_pretty(&utxo)?);
+            }
+        }
+        Commands::ListUtxoRegular => {
+            let utxos = taker.get_wallet().list_descriptor_utxo_spend_info(None)?;
+            for utxo in utxos {
+                let utxo = UTXO::from_utxo_data(utxo);
+                println!("{}", serde_json::to_string_pretty(&utxo)?);
+            }
         }
         Commands::ListUtxoSwap => {
-            let utxos: Vec<ListUnspentResultEntry> = taker
+            let utxos = taker
                 .get_wallet()
-                .list_swap_coin_utxo_spend_info(None)?
-                .iter()
-                .map(|(l, _)| l.clone())
-                .collect();
-            println!("{:#?}", utxos);
+                .list_incoming_swap_coin_utxo_spend_info(None)?;
+            for utxo in utxos {
+                let utxo = UTXO::from_utxo_data(utxo);
+                println!("{}", serde_json::to_string_pretty(&utxo)?);
+            }
         }
         Commands::ListUtxoContract => {
-            let utxos: Vec<ListUnspentResultEntry> = taker
+            let utxos = taker
                 .get_wallet()
-                .list_live_contract_spend_info(None)?
-                .iter()
-                .map(|(l, _)| l.clone())
-                .collect();
-            println!("{:#?}", utxos);
+                .list_live_timelock_contract_spend_info(None)?;
+            for utxo in utxos {
+                let utxo = UTXO::from_utxo_data(utxo);
+                println!("{}", serde_json::to_string_pretty(&utxo)?);
+            }
         }
-        Commands::GetBalanceContract => {
-            let balance = taker.get_wallet().balance_live_contract(None)?;
-            println!("{:?}", balance);
-        }
-        Commands::GetBalanceSwap => {
-            let balance = taker.get_wallet().balance_swap_coins(None)?;
-            println!("{:?}", balance);
-        }
-        Commands::GetBalance => {
-            let balance = taker.get_wallet().spendable_balance()?;
-            println!("{:?}", balance);
+        Commands::GetBalances => {
+            let balances = taker.get_wallet().get_balances(None)?;
+            println!(
+                "{}",
+                to_string_pretty(&json!({
+                    "regular": balances.regular.to_sat(),
+                    "contract": balances.contract.to_sat(),
+                    "swap": balances.swap.to_sat(),
+                    "spendable": balances.spendable.to_sat(),
+                }))
+                .unwrap()
+            );
         }
         Commands::GetNewAddress => {
             let address = taker.get_wallet_mut().get_next_external_address()?;
@@ -178,31 +194,19 @@ fn main() -> Result<(), TakerError> {
         Commands::SendToAddress {
             address,
             amount,
-            fee,
+            feerate,
         } => {
-            // NOTE:
-            //
-            // Currently, we take `fee` instead of `fee_rate` because we cannot calculate the fee for a
-            // transaction that hasn't been created yet when only a `fee_rate` is provided.
-            //
-            // As a result, the user must supply the fee as a parameter, and the function will return the
-            // transaction hex and the calculated `fee_rate`.
-            // This allows the user to infer what fee is needed for a successful transaction.
-            //
-            // This approach will be improved in the future BDK integration.
-
-            let fee = Amount::from_sat(fee);
-
             let amount = Amount::from_sat(amount);
 
-            let coins_to_spend = taker.get_wallet().coin_select(amount + fee)?;
+            let coins_to_spend = taker.get_wallet().coin_select(amount)?;
 
-            let destination =
-                Destination::Address(Address::from_str(&address).unwrap().assume_checked());
+            let destination = Destination::Multi(vec![(
+                Address::from_str(&address).unwrap().assume_checked(),
+                amount,
+            )]);
 
             let tx = taker.get_wallet_mut().spend_from_wallet(
-                fee,
-                SendAmount::Amount(amount),
+                feerate.unwrap_or(DEFAULT_TX_FEE_RATE),
                 destination,
                 &coins_to_spend,
             )?;
@@ -210,10 +214,11 @@ fn main() -> Result<(), TakerError> {
             let txid = taker.get_wallet().send_tx(&tx).unwrap();
 
             println!("{}", txid);
+
+            taker.get_wallet_mut().sync_no_fail();
         }
 
         Commands::FetchOffers => {
-            println!("Fetching offerdata from the market. use `tail -f <data-dir>/debug.log` to see progress.");
             let offerbook = taker.fetch_offers()?;
             println!("{:#?}", offerbook)
         }
@@ -224,16 +229,11 @@ fn main() -> Result<(), TakerError> {
                 tx_count: 1,
                 required_confirms: REQUIRED_CONFIRMS,
             };
-
-            println!("Starting coinswap with swap params : {:?}. use `tail -f <data-dir>/debug.log` to see progress.", swap_params);
             taker.do_coinswap(swap_params)?;
-            println!("succesfully completed coinswap!! Check `list-utxo` to see the new coins");
         }
 
         Commands::Recover => {
-            println!("Starting recovery. use `tail -f <data-dir>/debug.log` to see progress.");
             taker.recover_from_swap()?;
-            println!("Recovery completed succesfully.");
         }
     }
 

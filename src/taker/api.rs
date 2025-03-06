@@ -12,15 +12,13 @@ use std::{
     collections::{HashMap, HashSet},
     io::BufWriter,
     net::TcpStream,
-    path::{Path, PathBuf},
-    process::Child,
+    path::PathBuf,
     thread::sleep,
     time::{Duration, Instant},
 };
 
 use bitcoind::bitcoincore_rpc::RpcApi;
 
-#[cfg(feature = "tor")]
 use socks::Socks5Stream;
 
 use bitcoin::{
@@ -55,9 +53,6 @@ use crate::{
         WalletSwapCoin, WatchOnlySwapCoin,
     },
 };
-
-#[cfg(feature = "tor")]
-use crate::tor::kill_tor_handles;
 
 // Default values for Taker configurations
 pub(crate) const REFUND_LOCKTIME: u16 = 20;
@@ -173,7 +168,6 @@ pub struct Taker {
     offerbook: OfferBook,
     ongoing_swap_state: OngoingSwapState,
     behavior: TakerBehavior,
-    tor_handle: Option<Child>,
     data_dir: PathBuf,
 }
 
@@ -186,15 +180,6 @@ impl Drop for Taker {
         log::info!("offerbook data saved to disk.");
         self.wallet.save_to_disk().unwrap();
         log::info!("Wallet data saved to disk.");
-
-        if !cfg!(feature = "tor") {
-            assert!(self.tor_handle.is_some(), "Tor handle should not exist")
-        }
-
-        #[cfg(feature = "tor")]
-        if let Some(handle) = &mut self.tor_handle {
-            kill_tor_handles(handle);
-        }
     }
 }
 
@@ -219,6 +204,8 @@ impl Taker {
         wallet_file_name: Option<String>,
         rpc_config: Option<RPCConfig>,
         behavior: TakerBehavior,
+        control_port: Option<u16>,
+        tor_auth_password: Option<String>,
         connection_type: Option<ConnectionType>,
     ) -> Result<Taker, TakerError> {
         // Get provided data directory or the default data directory.
@@ -249,6 +236,13 @@ impl Taker {
 
         if let Some(connection_type) = connection_type {
             config.connection_type = connection_type;
+        }
+
+        config.control_port = control_port.unwrap_or(config.control_port);
+        config.tor_auth_password =
+            tor_auth_password.unwrap_or_else(|| config.tor_auth_password.clone());
+        if matches!(connection_type, Some(ConnectionType::TOR)) {
+            check_tor_status(config.control_port, config.tor_auth_password.as_str())?;
         }
 
         config.write_to_file(&data_dir.join("config.toml"))?;
@@ -288,7 +282,6 @@ impl Taker {
             offerbook,
             ongoing_swap_state: OngoingSwapState::default(),
             behavior,
-            tor_handle: None,
             data_dir,
         })
     }
@@ -305,50 +298,7 @@ impl Taker {
 
     ///  Does the coinswap process
     pub fn do_coinswap(&mut self, swap_params: SwapParams) -> Result<(), TakerError> {
-        self.tor_handle = self.setup_tor()?;
         self.send_coinswap(swap_params)
-    }
-
-    fn setup_tor(&self) -> Result<Option<Child>, TakerError> {
-        match self.config.connection_type {
-            ConnectionType::CLEARNET => Ok(None),
-            #[cfg(feature = "tor")]
-            ConnectionType::TOR => {
-                let tor_dir = self.data_dir.join("tor");
-                let tor_log_file = tor_dir.join("log");
-
-                // Hard error if previous log file can't be removed, as monitor_log_for_completion doesn't work with existing file.
-                // Tell the user to manually delete the file and restart.
-                if tor_log_file.exists() {
-                    if let Err(e) = std::fs::remove_file(&tor_log_file) {
-                        log::error!(
-                        "Error removing previous tor log. Please delete the file and restart. | {:?}",
-                        tor_log_file
-                    );
-                        return Err(e.into());
-                    } else {
-                        log::info!("Previous tor log file deleted succesfully");
-                    }
-                }
-
-                let handle = Some(crate::tor::spawn_tor(
-                    self.config.socks_port,
-                    self.config.network_port,
-                    tor_dir.to_str().unwrap().to_owned(),
-                )?);
-
-                if let Err(e) =
-                    monitor_log_for_completion(&tor_log_file, "Bootstrapped 100% (done): Done")
-                {
-                    log::error!("Error monitoring taker log file. Try removing the tor log file {:?} and try again. | {}", tor_log_file, e);
-                    return Err(e.into());
-                }
-
-                log::info!("tor is ready!");
-
-                Ok(handle)
-            }
-        }
     }
 
     /// Perform a coinswap round with given [SwapParams]. The Taker will try to perform swap with makers
@@ -361,6 +311,21 @@ impl Taker {
     ///
     /// If that fails too. Open an issue at [our github](https://github.com/citadel-tech/coinswap/issues)
     pub(crate) fn send_coinswap(&mut self, swap_params: SwapParams) -> Result<(), TakerError> {
+        // Check if we have enough balance.
+        let available = self.wallet.get_balances(None)?.spendable;
+
+        // TODO: Make more exact estimate of swap cost and ensure balance.
+        // For now ensure at least swap_amount + 1000 sats is available.
+        let required = swap_params.send_amount + Amount::from_sat(1000);
+        if available < required {
+            let err = WalletError::InsufficientFund {
+                available: available.to_sat(),
+                required: required.to_sat(),
+            };
+            log::error!("Not enough balance to do swap : {:?}", err);
+            return Err(err.into());
+        }
+
         log::info!("Syncing Offerbook");
         self.sync_offerbook()?;
 
@@ -391,20 +356,6 @@ impl Taker {
         self.ongoing_swap_state.active_preimage = preimage;
         self.ongoing_swap_state.swap_params = swap_params;
         self.ongoing_swap_state.id = unique_id;
-
-        let available = self.wallet.spendable_balance()?;
-
-        // TODO: Make more exact estimate of swap cost and ensure balanbce.
-        // For now ensure at least swap_amount + 10000 is available.
-        let required = swap_params.send_amount + Amount::from_sat(1000);
-        if available < required {
-            let err = WalletError::InsufficientFund {
-                available: available.to_btc(),
-                required: required.to_btc(),
-            };
-            log::error!("Not enough balance to cover swap : {:#?}", err);
-            return Err(err.into());
-        }
 
         // Try first hop. Abort if error happens.
         if let Err(e) = self.init_first_hop() {
@@ -522,7 +473,6 @@ impl Taker {
         }
 
         log::info!("Initializing Sync and Save.");
-        self.wallet.sync()?;
         self.save_and_reset_swap_round()?;
         log::info!("Completed Sync and Save.");
         log::info!("Successfully Completed Coinswap.");
@@ -628,7 +578,7 @@ impl Taker {
             .iter()
             .map(|tx| {
                 let txid = self.wallet.send_tx(tx)?;
-                log::info!("Funding Txid: {}", txid);
+                log::info!("Broadcasted Funding tx. txid: {}", txid);
                 assert_eq!(txid, tx.compute_txid());
                 Ok(txid)
             })
@@ -665,7 +615,7 @@ impl Taker {
         let mut txid_tx_map = HashMap::<Txid, Transaction>::new();
         let mut txid_blockhash_map = HashMap::<Txid, BlockHash>::new();
 
-        // Required confirmation target for the funding txs.
+        // Find next maker's details
         let required_confirmations =
             if self.ongoing_swap_state.taker_position == TakerPosition::LastPeer {
                 self.ongoing_swap_state.swap_params.required_confirms
@@ -673,22 +623,34 @@ impl Taker {
                 self.ongoing_swap_state
                     .peer_infos
                     .last()
+                    .map(|npi| npi.peer.offer.required_confirms)
                     .expect("Maker information expected in swap state")
-                    .peer
-                    .offer
-                    .required_confirms
             };
+
+        let maker_addrs = self
+            .ongoing_swap_state
+            .peer_infos
+            .iter()
+            .map(|npi| npi.peer.address.clone())
+            .collect::<HashSet<_>>();
+
         log::info!(
-            "Waiting for funding transaction confirmations ({} conf required)",
-            required_confirmations
+            "Waiting for funding transaction confirmation. Txids : {:?}",
+            funding_txids
         );
-        let mut txids_seen_once = HashSet::<Txid>::new();
 
         // Wait for this much time for txs to appear in mempool.
-        let wait_time = if cfg!(feature = "integration-test") {
+        let mempool_wait_timeout = if cfg!(feature = "integration-test") {
             10u64 // 10 secs for the tests
         } else {
             60 * 5 // 5mins for production
+        };
+
+        // Check for funding confirmation at this frequency
+        let sleep_interval = if cfg!(feature = "integration-test") {
+            1u64 // 1 secs for the tests
+        } else {
+            30 // 30 secs for production
         };
 
         let start_time = Instant::now();
@@ -698,14 +660,14 @@ impl Taker {
             // TODO: Find the culprit Maker, and ban it's fidelity bond.
             let contracts_broadcasted = self.check_for_broadcasted_contract_txes();
             if !contracts_broadcasted.is_empty() {
-                log::info!(
-                    "Contract transactions were broadcasted : {:?}",
+                log::error!(
+                    "Fatal! Contract txs broadcasted by makers. Txids : {:?}",
                     contracts_broadcasted
                 );
                 return Err(TakerError::ContractsBroadcasted(contracts_broadcasted));
             }
 
-            // Check for funding transactions
+            // Check for each funding transactions if they are confirmed
             for txid in funding_txids {
                 if txid_tx_map.contains_key(txid) {
                     continue;
@@ -715,29 +677,42 @@ impl Taker {
                     // Transaction haven't arrived in our mempool, keep looping.
                     Err(_e) => {
                         let elapsed = start_time.elapsed().as_secs();
-                        log::info!("Waiting for mempool transaction for {}secs", elapsed);
-                        if elapsed > wait_time {
+                        log::info!(
+                            "Waiting for funding tx to appear in mempool | {} secs",
+                            elapsed
+                        );
+                        if elapsed > mempool_wait_timeout {
+                            log::error!("Timed out waiting for funding tx to appear in mempool. | No tx seen in {} secs", elapsed);
                             return Err(TakerError::FundingTxWaitTimeOut);
                         }
                         continue;
                     }
                 };
-                if !txids_seen_once.contains(txid) {
-                    txids_seen_once.insert(*txid);
-                    if gettx.confirmations.is_none() {
-                        let mempool_tx = match self.wallet.rpc.get_mempool_entry(txid) {
-                            Ok(m) => m,
-                            Err(_e) => {
-                                continue;
-                            }
-                        };
-                        log::info!(
-                            "Tx {} Seen in Mempool | [{:.1} sat/vbyte]",
-                            txid,
-                            (mempool_tx.fees.base.to_sat() as f32) / (mempool_tx.vsize as f32)
-                        );
+
+                // log that its waiting for confirmation.
+                if gettx.confirmations.is_none() {
+                    let elapsed = start_time.elapsed().as_secs();
+                    log::info!(
+                        "Funding tx Seen in Mempool. Waiting for confirmation for {} secs",
+                        elapsed,
+                    );
+
+                    // Send wait-notif to all makers
+                    for addr in &maker_addrs {
+                        // Ignore transient network error and retry in next loop.
+                        // It's safe to ignore the error here, because if the maker is actually offline, the swap will fail in the later stages.
+                        if let Err(e) = self.send_to_maker(
+                            addr,
+                            TakerToMakerMessage::WaitingFundingConfirmation(
+                                self.ongoing_swap_state.id.clone(),
+                            ),
+                        ) {
+                            log::error!("error sending wait-notif to maker {} | {:?}", addr, e);
+                        }
                     }
                 }
+
+                // handle confirmations
                 //TODO handle confirm<0
                 if gettx.confirmations >= Some(required_confirmations) {
                     txid_tx_map.insert(
@@ -777,7 +752,7 @@ impl Taker {
                     .map_err(WalletError::from)?;
                 return Ok((txes, merkleproofs));
             }
-            sleep(Duration::from_millis(1000));
+            sleep(Duration::from_secs(sleep_interval));
         }
     }
 
@@ -961,7 +936,6 @@ impl Taker {
         let address = this_maker.address.to_string();
         let mut socket = match self.config.connection_type {
             ConnectionType::CLEARNET => TcpStream::connect(address)?,
-            #[cfg(feature = "tor")]
             ConnectionType::TOR => Socks5Stream::connect(
                 format!("127.0.0.1:{}", self.config.socks_port).as_str(),
                 address.as_str(),
@@ -1033,7 +1007,7 @@ impl Taker {
                         .collect()
                 };
 
-            log::info!("===> Sending ProofOfFunding to {}", this_maker.address);
+            log::info!("===> ProofOfFunding | {}", this_maker.address);
 
             let funding_txids = funding_tx_infos
                 .iter()
@@ -1064,7 +1038,7 @@ impl Taker {
                     self.ongoing_swap_state.id.clone(),
                 )?;
             log::info!(
-                "<=== Recieved ContractSigsAsRecvrAndSender from {}",
+                "<=== ReqContractSigsAsRecvrAndSender | {}",
                 this_maker.address
             );
 
@@ -1147,10 +1121,6 @@ impl Taker {
             // If Next Maker is the Receiver, and Previous Maker is the Sender, request Previous Maker to sign the Reciever's Contract Tx.
             let previous_maker = previous_maker.expect("Previous Maker should always exists");
             let previous_maker_addr = &previous_maker.peer.address;
-            log::info!(
-                "===> Sending SignReceiversContractTx, previous maker is {}",
-                previous_maker_addr
-            );
             let previous_maker_watchonly_swapcoins =
                 if self.ongoing_swap_state.taker_position == TakerPosition::LastPeer {
                     self.ongoing_swap_state
@@ -1178,7 +1148,7 @@ impl Taker {
             }
         };
         log::info!(
-            "===> Sending ContractSigsAsReceiverAndSender to {}",
+            "===> RespContractSigsForRecvrAndSender | {}",
             this_maker.address
         );
         let id = self.ongoing_swap_state.id.clone();
@@ -1376,10 +1346,6 @@ impl Taker {
             .expect("previous maker expected")
             .peer
             .clone();
-        log::info!(
-            "===> Sending ReqContractSigsForRecvr to {}",
-            last_maker.address
-        );
         let receiver_contract_sig = match self.req_sigs_for_recvr(
             &last_maker.address,
             &self.ongoing_swap_state.incoming_swapcoins,
@@ -1445,7 +1411,6 @@ impl Taker {
 
         let mut socket = match self.config.connection_type {
             ConnectionType::CLEARNET => TcpStream::connect(maker_addr_str.clone())?,
-            #[cfg(feature = "tor")]
             ConnectionType::TOR => Socks5Stream::connect(
                 format!("127.0.0.1:{}", self.config.socks_port).as_str(),
                 &*maker_addr_str,
@@ -1458,7 +1423,7 @@ impl Taker {
 
         loop {
             ii += 1;
-            log::info!("Connecting to {} | Req Sigs for Sender", maker_addr_str);
+            log::info!("===> ReqContractSigsForSender | {}", maker_addr_str);
             match req_sigs_for_sender_once(
                 &mut socket,
                 outgoing_swapcoins,
@@ -1466,7 +1431,12 @@ impl Taker {
                 maker_hashlock_nonces,
                 locktime,
             ) {
-                Ok(ret) => return Ok(ret),
+                Ok(ret) => {
+                    return {
+                        log::info!("<=== RespContractSigsForSender | {}", maker_addr_str);
+                        Ok(ret)
+                    }
+                }
                 Err(e) => {
                     log::warn!(
                         "Failed to connect to maker {} to request signatures for receiver, \
@@ -1529,7 +1499,6 @@ impl Taker {
         let maker_addr_str = maker_address.to_string();
         let mut socket = match self.config.connection_type {
             ConnectionType::CLEARNET => TcpStream::connect(maker_addr_str.clone())?,
-            #[cfg(feature = "tor")]
             ConnectionType::TOR => Socks5Stream::connect(
                 format!("127.0.0.1:{}", self.config.socks_port).as_str(),
                 &*maker_addr_str,
@@ -1542,10 +1511,13 @@ impl Taker {
 
         loop {
             ii += 1;
-            log::info!("Connecting to {} | Req Sigs for Receiver", maker_addr_str);
+            log::info!("===> ReqContractSigsForRecvr | {}", maker_addr_str);
             match req_sigs_for_recvr_once(&mut socket, incoming_swapcoins, receivers_contract_txes)
             {
-                Ok(ret) => return Ok(ret),
+                Ok(ret) => {
+                    log::info!("<=== RespContractSigsForRecvr | {}", maker_addr_str);
+                    return Ok(ret);
+                }
                 Err(e) => {
                     log::warn!(
                         "Failed to connect to maker {} to request signatures for receiver, \
@@ -1632,23 +1604,7 @@ impl Taker {
                         .collect::<Vec<_>>()
                 };
 
-            let reconnect_time_out = Duration::from_secs(TCP_TIMEOUT_SECONDS);
-
             let mut ii = 0;
-
-            let maker_addr_str = maker_address.address.to_string();
-            let mut socket = match self.config.connection_type {
-                ConnectionType::CLEARNET => TcpStream::connect(maker_addr_str.clone())?,
-                #[cfg(feature = "tor")]
-                ConnectionType::TOR => Socks5Stream::connect(
-                    format!("127.0.0.1:{}", self.config.socks_port).as_str(),
-                    &*maker_addr_str,
-                )?
-                .into_inner(),
-            };
-
-            socket.set_read_timeout(Some(reconnect_time_out))?;
-            socket.set_write_timeout(Some(reconnect_time_out))?;
 
             // Configurable reconnection attempts for testing
             let reconnect_attempts = if cfg!(feature = "integration-test") {
@@ -1666,9 +1622,8 @@ impl Taker {
 
             loop {
                 ii += 1;
-                log::info!("Connecting to {} || Settle Swap", maker_addr_str);
                 match self.settle_one_coinswap(
-                    &mut socket,
+                    &maker_address.address,
                     index,
                     &mut outgoing_privkeys,
                     &senders_multisig_redeemscripts,
@@ -1712,25 +1667,34 @@ impl Taker {
     /// [Internal] Setlle one swap. This is recursively called for all the makers.
     fn settle_one_coinswap(
         &mut self,
-        socket: &mut TcpStream,
+        maker_address: &MakerAddress,
         index: usize,
         outgoing_privkeys: &mut Option<Vec<MultisigPrivkey>>, // TODO: Instead of Option, just take a vector, where empty vector denotes the `None` equivalent.
         senders_multisig_redeemscripts: &[ScriptBuf],
         receivers_multisig_redeemscripts: &[ScriptBuf],
     ) -> Result<(), TakerError> {
-        handshake_maker(socket)?;
+        let maker_addr_str = maker_address.to_string();
+        let mut socket = match self.config.connection_type {
+            ConnectionType::CLEARNET => TcpStream::connect(maker_addr_str.clone())?,
+            ConnectionType::TOR => Socks5Stream::connect(
+                format!("127.0.0.1:{}", self.config.socks_port).as_str(),
+                &*maker_addr_str,
+            )?
+            .into_inner(),
+        };
 
-        log::info!("===> Sending HashPreimage to {}", socket.peer_addr()?);
+        socket.set_read_timeout(Some(Duration::from_secs(TCP_TIMEOUT_SECONDS)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(TCP_TIMEOUT_SECONDS)))?;
+        handshake_maker(&mut socket)?;
+
+        log::info!("===> HashPreimage | {}", maker_address);
         let maker_private_key_handover = send_hash_preimage_and_get_private_keys(
-            socket,
+            &mut socket,
             senders_multisig_redeemscripts,
             receivers_multisig_redeemscripts,
             &self.ongoing_swap_state.active_preimage,
         )?;
-        log::info!(
-            "<=== Received PrivateKeyHandover from {}",
-            socket.peer_addr()?
-        );
+        log::info!("<=== PrivateKeyHandover | {}", maker_address);
 
         let privkeys_reply = if self.ongoing_swap_state.taker_position == TakerPosition::FirstPeer {
             self.ongoing_swap_state
@@ -1766,9 +1730,9 @@ impl Taker {
             *outgoing_privkeys = Some(maker_private_key_handover.multisig_privkeys);
             ret
         })?;
-        log::info!("===> Sending PrivateKeyHandover to {}", socket.peer_addr()?);
+        log::info!("===> PrivateKeyHandover | {}", maker_address);
         send_message(
-            socket,
+            &mut socket,
             &TakerToMakerMessage::RespPrivKeyHandover(PrivKeyHandover {
                 multisig_privkeys: privkeys_reply,
             }),
@@ -1825,12 +1789,24 @@ impl Taker {
 
     /// Save all the finalized swap data and reset the [OngoingSwapState].
     fn save_and_reset_swap_round(&mut self) -> Result<(), TakerError> {
+        // Mark incoiming swapcoins as done
         for incoming_swapcoin in &self.ongoing_swap_state.incoming_swapcoins {
             self.wallet
                 .find_incoming_swapcoin_mut(&incoming_swapcoin.get_multisig_redeemscript())
                 .expect("Incoming swapcoin expeted")
                 .other_privkey = incoming_swapcoin.other_privkey;
         }
+
+        // Mark outgoing swapcoins as done.
+        for outgoing_swapcoins in &self.ongoing_swap_state.outgoing_swapcoins {
+            self.wallet
+                .find_outgoing_swapcoin_mut(&outgoing_swapcoins.get_multisig_redeemscript())
+                .expect("Outgoing swapcoin expected")
+                .hash_preimage = Some(self.ongoing_swap_state.active_preimage);
+        }
+
+        self.wallet.sync_no_fail();
+
         self.wallet.save_to_disk()?;
 
         self.clear_ongoing_swaps();
@@ -1895,16 +1871,19 @@ impl Taker {
                 .get_raw_transaction_info(&contract_tx.compute_txid(), None)
                 .is_ok()
             {
-                log::info!("Incoming Contract already broadacsted");
+                log::info!(
+                    "Incoming Contract already broadacsted. Txid : {}",
+                    contract_tx.compute_txid()
+                );
             } else {
                 self.wallet.send_tx(contract_tx)?;
                 log::info!(
-                    "Broadcasted Incoming Contract. Removing from wallet. Contract Txid {}",
+                    "Broadcasting Incoming Contract. Removing from wallet. Txid : {}",
                     contract_tx.compute_txid()
                 );
             }
             log::info!(
-                "Incoming Swapcoin removed from wallet, Contact Txid: {}",
+                "Incoming Swapcoin removed from wallet, Txid: {}",
                 contract_tx.compute_txid()
             );
             self.wallet.remove_incoming_swapcoin(redeemscript)?;
@@ -1913,6 +1892,7 @@ impl Taker {
         let mut outgoing_infos = Vec::new();
 
         // Broadcast the Outgoing Contracts
+        self.get_wallet_mut().sync()?;
         for outgoing in outgoings {
             let contract_tx = outgoing.get_fully_signed_contract_tx()?;
             if self
@@ -1921,18 +1901,23 @@ impl Taker {
                 .get_raw_transaction_info(&contract_tx.compute_txid(), None)
                 .is_ok()
             {
-                log::info!("Outgoing Contract already broadcasted");
+                log::info!(
+                    "Outgoing Contract already broadcasted | Txid: {}",
+                    contract_tx.compute_txid()
+                );
             } else {
                 self.wallet.send_tx(&contract_tx)?;
                 log::info!(
-                    "Broadcasted Outgoing Contract, Contract txid : {}",
+                    "Broadcasted Outgoing Contract | txid : {}",
                     contract_tx.compute_txid()
                 );
             }
             let reedemscript = outgoing.get_multisig_redeemscript();
             let timelock = outgoing.get_timelock()?;
             let next_internal = &self.wallet.get_next_internal_addresses(1)?[0];
-            let timelock_spend = outgoing.create_timelock_spend(next_internal)?;
+            let timelock_spend =
+                self.wallet
+                    .create_timelock_spend(&outgoing, next_internal, DEFAULT_TX_FEE_RATE)?;
             outgoing_infos.push(((reedemscript, contract_tx), (timelock, timelock_spend)));
         }
 
@@ -2002,6 +1987,11 @@ impl Taker {
             }
 
             // Everything is broadcasted. Clear the connectionstate and break the loop
+            log::info!(
+                "{} outgoing contracts detected | {} timelock txs broadcasted.",
+                outgoing_infos.len(),
+                timelock_boardcasted.len()
+            );
             if timelock_boardcasted.len() == outgoing_infos.len() {
                 log::info!("All outgoing contracts reedemed. Cleared ongoing swap state");
                 // TODO: Reevaluate this.
@@ -2032,29 +2022,14 @@ impl Taker {
                     self.config.directory_server_address.clone()
                 }
             }
-            #[cfg(feature = "tor")]
-            ConnectionType::TOR => {
-                if cfg!(feature = "integration-test") {
-                    let tor_dir = Path::new("/tmp/coinswap/dns/tor");
-
-                    let hostname = get_tor_hostname(tor_dir)?;
-                    log::info!("---------------hostname : {:?}", hostname);
-                    format!("{}:{}", hostname, 8080)
-                } else {
-                    self.config.directory_server_address.clone()
-                }
-            }
+            ConnectionType::TOR => self.config.directory_server_address.clone(),
         };
 
-        let socks_port = if cfg!(feature = "tor") {
-            if self.config.connection_type == ConnectionType::CLEARNET {
-                None
-            } else {
-                Some(self.config.socks_port)
-            }
-        } else {
-            None
-        };
+        #[cfg(not(feature = "integration-test"))]
+        let socks_port = Some(self.config.socks_port);
+
+        #[cfg(feature = "integration-test")]
+        let socks_port = None;
 
         log::info!("Fetching addresses from DNS: {}", dns_addr);
 
@@ -2105,8 +2080,34 @@ impl Taker {
     /// fetches only the offer data from DNS and returns the updated Offerbook.
     /// Used for taker cli app, in `fetch-offers` command.
     pub fn fetch_offers(&mut self) -> Result<&OfferBook, TakerError> {
-        self.tor_handle = self.setup_tor()?;
         self.sync_offerbook()?;
         Ok(&self.offerbook)
+    }
+
+    /// Send any message to a maker
+    fn send_to_maker(
+        &self,
+        maker_addr: &MakerAddress,
+        msg: TakerToMakerMessage,
+    ) -> Result<(), TakerError> {
+        // Notify the maker that we are waiting for funding confirmation
+        let address = maker_addr.to_string();
+        let mut socket = match self.config.connection_type {
+            ConnectionType::CLEARNET => TcpStream::connect(address)?,
+            ConnectionType::TOR => Socks5Stream::connect(
+                format!("127.0.0.1:{}", self.config.socks_port).as_str(),
+                address.as_str(),
+            )?
+            .into_inner(),
+        };
+
+        let reconnect_timeout = Duration::from_secs(TCP_TIMEOUT_SECONDS);
+
+        socket.set_write_timeout(Some(reconnect_timeout))?;
+
+        send_message(&mut socket, &msg)?;
+        log::info!("===> {} | {}", msg, maker_addr);
+
+        Ok(())
     }
 }

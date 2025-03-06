@@ -204,6 +204,7 @@ pub(crate) enum TakerToMakerMessage {
     RespHashPreimage(HashPreimage),
     /// Respond by handing over the Private Keys of coinswap multisig. This denotes the completion of the whole swap.
     RespPrivKeyHandover(PrivKeyHandover),
+    WaitingFundingConfirmation(String),
 }
 
 impl Display for TakerToMakerMessage {
@@ -219,6 +220,7 @@ impl Display for TakerToMakerMessage {
             Self::ReqContractSigsForRecvr(_) => write!(f, "ReqContractSigsForRecvr"),
             Self::RespHashPreimage(_) => write!(f, "RespHashPreimage"),
             Self::RespPrivKeyHandover(_) => write!(f, "RespPrivKeyHandover"),
+            Self::WaitingFundingConfirmation(_) => write!(f, "WaitingFundingConfirmation"),
         }
     }
 }
@@ -315,6 +317,24 @@ impl Display for MakerToTakerMessage {
                 write!(f, "RespContractSigsForRecvr")
             }
             Self::RespPrivKeyHandover(_) => write!(f, "RespPrivKeyHandover"),
+        }
+    }
+}
+
+/// All messages sent from DNS to Maker
+#[derive(Debug, Serialize, Deserialize)]
+pub enum DnsResponse {
+    /// Posting request by Maker was accepted by DNS.
+    Ack,
+    /// Posting request by Maker was rejected by DNS.
+    Nack(String),
+}
+
+impl Display for DnsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ack => write!(f, "DNS Ack"),
+            Self::Nack(s) => write!(f, "DNS Nack {}", s.as_str()),
         }
     }
 }

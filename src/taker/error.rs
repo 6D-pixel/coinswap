@@ -1,7 +1,7 @@
 //! All Taker-related errors.
 use crate::{
     error::NetError, market::directory::DirectoryServerError, protocol::error::ProtocolError,
-    wallet::WalletError,
+    utill::TorError, wallet::WalletError,
 };
 
 /// Represents errors that can occur during Taker operations.
@@ -28,16 +28,30 @@ pub enum TakerError {
     /// Error indicating a timeout while waiting for the funding transaction.
     FundingTxWaitTimeOut,
     /// Error deserializing data, typically related to CBOR-encoded data.
-    Deserialize(serde_cbor::Error),
+    Deserialize(String),
     /// Error indicating an MPSC channel failure.
     ///
     /// This error occurs during internal thread communication.
     MPSC(String),
+    /// Tor error
+    TorError(TorError),
+}
+
+impl From<TorError> for TakerError {
+    fn from(value: TorError) -> Self {
+        Self::TorError(value)
+    }
 }
 
 impl From<serde_cbor::Error> for TakerError {
     fn from(value: serde_cbor::Error) -> Self {
-        Self::Deserialize(value)
+        Self::Deserialize(value.to_string())
+    }
+}
+
+impl From<serde_json::Error> for TakerError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Deserialize(value.to_string())
     }
 }
 

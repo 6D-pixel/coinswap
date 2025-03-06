@@ -4,7 +4,7 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use coinswap::{
     maker::{start_maker_server, MakerBehavior},
     taker::TakerBehavior,
-    utill::ConnectionType,
+    utill::{ConnectionType, DEFAULT_TX_FEE_RATE},
 };
 mod test_framework;
 use test_framework::*;
@@ -105,6 +105,7 @@ fn test_fidelity() {
                 Amount::from_sat(8000000),
                 LockTime::from_height((bitcoind.client.get_block_count().unwrap() as u32) + 950)
                     .unwrap(),
+                DEFAULT_TX_FEE_RATE,
             )
             .unwrap();
 
@@ -129,11 +130,10 @@ fn test_fidelity() {
     {
         let wallet_read = maker.get_wallet().read().unwrap();
 
-        let fidelity_balance = wallet_read.balance_fidelity_bonds(None).unwrap();
-        let seed_balance = wallet_read.balance_descriptor_utxo(None).unwrap();
+        let balances = wallet_read.get_balances(None).unwrap();
 
-        assert_eq!(fidelity_balance.to_sat(), 13000000);
-        assert_eq!(seed_balance.to_sat(), 90998000);
+        assert_eq!(balances.fidelity.to_sat(), 13000000);
+        assert_eq!(balances.regular.to_sat(), 90998000);
     }
 
     // Wait for the bonds to mature, redeem them, and validate the process.
@@ -156,7 +156,9 @@ fn test_fidelity() {
             if required_height == first_maturity_height {
                 log::info!("First Fidelity Bond  is matured. Sending redemption transaction");
 
-                let _ = wallet_write.redeem_fidelity(0).unwrap();
+                let _ = wallet_write
+                    .redeem_fidelity(0, DEFAULT_TX_FEE_RATE)
+                    .unwrap();
 
                 log::info!("First Fidelity Bond is successfully redeemed.");
 
@@ -170,7 +172,9 @@ fn test_fidelity() {
             } else {
                 log::info!("Second Fidelity Bond  is matured. sending redemption transactions");
 
-                let _ = wallet_write.redeem_fidelity(1).unwrap();
+                let _ = wallet_write
+                    .redeem_fidelity(1, DEFAULT_TX_FEE_RATE)
+                    .unwrap();
 
                 log::info!("Second Fidelity Bond is successfully redeemed.");
 
@@ -185,11 +189,10 @@ fn test_fidelity() {
     // Verify the balances again after all bonds are redeemed.
     {
         let wallet_read = maker.get_wallet().read().unwrap();
-        let fidelity_balance = wallet_read.balance_fidelity_bonds(None).unwrap();
-        let seed_balance = wallet_read.balance_descriptor_utxo(None).unwrap();
+        let balances = wallet_read.get_balances(None).unwrap();
 
-        assert_eq!(fidelity_balance.to_sat(), 0);
-        assert_eq!(seed_balance.to_sat(), 103996000);
+        assert_eq!(balances.fidelity.to_sat(), 0);
+        assert_eq!(balances.regular.to_sat(), 103996000);
     }
 
     // Stop the directory server.

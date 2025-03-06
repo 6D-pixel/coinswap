@@ -13,34 +13,118 @@
 //! Checkout `tests/standard_swap.rs` for example of simple coinswap simulation test between 1 Taker and 2 Makers.
 use bitcoin::Amount;
 use std::{
-    env::{self, consts},
-    fs,
+    env,
+    fs::{self, create_dir_all, File},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    process,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
+        mpsc::{self, Receiver, Sender},
         Arc,
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
-use coinswap::utill::ConnectionType;
-use std::{
-    io::{BufRead, BufReader},
-    process,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use flate2::read::GzDecoder;
+use tar::Archive;
 
-use bitcoind::bitcoincore_rpc::Auth;
+use bitcoind::{
+    bitcoincore_rpc::{Auth, RpcApi},
+    BitcoinD,
+};
 
 use coinswap::{
     maker::{Maker, MakerBehavior},
     market::directory::{start_directory_server, DirectoryServer},
     taker::{Taker, TakerBehavior},
-    utill::setup_logger,
+    utill::{setup_logger, ConnectionType},
     wallet::RPCConfig,
 };
+
+const BITCOIN_VERSION: &str = "28.1";
+
+fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
+    for attempt in 1..=retries {
+        let response = minreq::get(download_url).send();
+        match response {
+            Ok(res) if res.status_code == 200 => {
+                return res.as_bytes().to_vec();
+            }
+            Ok(res) if res.status_code == 503 => {
+                // If the response is 503, log and prepare for retry
+                eprintln!(
+                    "Attempt {}: URL {} returned status code 503 (Service Unavailable)",
+                    attempt + 1,
+                    download_url
+                );
+            }
+            Ok(res) => {
+                // For other status codes, log and stop retrying
+                panic!(
+                    "URL {} returned unexpected status code {}. Aborting.",
+                    download_url, res.status_code
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "Attempt {}: Failed to fetch URL {}: {:?}",
+                    attempt, download_url, err
+                );
+            }
+        }
+
+        if attempt < retries {
+            let delay = 1u64 << (attempt - 1);
+            eprintln!("Retrying in {} seconds (exponential backoff)...", delay);
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+        }
+    }
+    // If all retries fail, panic with an error message
+    panic!(
+        "Cannot reach URL {} after {} attempts",
+        download_url, retries
+    );
+}
+
+fn read_tarball_from_file(path: &str) -> Vec<u8> {
+    let file = File::open(path).unwrap_or_else(|_| {
+        panic!(
+            "Cannot find {:?} specified with env var BITCOIND_TARBALL_FILE",
+            path
+        )
+    });
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).unwrap();
+    buffer
+}
+
+fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
+    let decoder = GzDecoder::new(tarball_bytes);
+    let mut archive = Archive::new(decoder);
+    for mut entry in archive.entries().unwrap().flatten() {
+        if let Ok(file) = entry.path() {
+            if file.ends_with("bitcoind") {
+                entry.unpack_in(destination).unwrap();
+            }
+        }
+    }
+}
+
+fn get_bitcoind_filename(os: &str, arch: &str) -> String {
+    match (os, arch) {
+        ("macos", "aarch64") => format!("bitcoin-{}-arm64-apple-darwin.tar.gz", BITCOIN_VERSION),
+        ("macos", "x86_64") => format!("bitcoin-{}-x86_64-apple-darwin.tar.gz", BITCOIN_VERSION),
+        ("linux", "x86_64") => format!("bitcoin-{}-x86_64-linux-gnu.tar.gz", BITCOIN_VERSION),
+        ("linux", "aarch64") => format!("bitcoin-{}-aarch64-linux-gnu.tar.gz", BITCOIN_VERSION),
+        _ => format!(
+            "bitcoin-{}-x86_64-apple-darwin-unsigned.zip",
+            BITCOIN_VERSION
+        ),
+    }
+}
 
 /// Initiate the bitcoind backend.
 pub(crate) fn init_bitcoind(datadir: &std::path::Path) -> BitcoinD {
@@ -50,17 +134,45 @@ pub(crate) fn init_bitcoind(datadir: &std::path::Path) -> BitcoinD {
     log::info!("bitcoind datadir: {:?}", conf.staticdir.as_ref().unwrap());
     log::info!("bitcoind configuration: {:?}", conf.args);
 
-    let os = consts::OS;
-    let arch = consts::ARCH;
+    let os = env::consts::OS;
+    let arch = env::consts::ARCH;
+    let current_dir: PathBuf = std::env::current_dir().expect("failed to read current dir");
+    let bitcoin_bin_dir = current_dir.join("bin");
+    let download_filename = get_bitcoind_filename(os, arch);
+    let bitcoin_exe_home = bitcoin_bin_dir
+        .join(format!("bitcoin-{}", BITCOIN_VERSION))
+        .join("bin");
 
-    let key = "BITCOIND_EXE";
-    let curr_dir_path = env::current_dir().unwrap();
+    if !bitcoin_exe_home.exists() {
+        let tarball_bytes = match env::var("BITCOIND_TARBALL_FILE") {
+            Ok(path) => read_tarball_from_file(&path),
+            Err(_) => {
+                let download_endpoint = env::var("BITCOIND_DOWNLOAD_ENDPOINT")
+                    .unwrap_or_else(|_| "http://172.81.178.3/bitcoin-binaries".to_owned());
+                let url = format!("{}/{}", download_endpoint, download_filename);
+                download_bitcoind_tarball(&url, 5)
+            }
+        };
 
-    let bitcoind_path = match (os, arch) {
-        ("macos", "aarch64") => curr_dir_path.join("bin").join("bitcoind_macos"),
-        _ => curr_dir_path.join("bin").join("bitcoind"),
-    };
-    env::set_var(key, bitcoind_path);
+        if let Some(parent) = bitcoin_exe_home.parent() {
+            create_dir_all(parent).unwrap();
+        }
+
+        unpack_tarball(&tarball_bytes, &bitcoin_bin_dir);
+
+        if os == "macos" {
+            let bitcoind_binary = bitcoin_exe_home.join("bitcoind");
+            std::process::Command::new("codesign")
+                .arg("--sign")
+                .arg("-")
+                .arg(&bitcoind_binary)
+                .output()
+                .expect("Failed to sign bitcoind binary");
+        }
+    }
+
+    env::set_var("BITCOIND_EXE", bitcoin_exe_home.join("bitcoind"));
+
     let exe_path = bitcoind::exe_path().unwrap();
 
     log::info!("Executable path: {:?}", exe_path);
@@ -131,13 +243,12 @@ pub(crate) fn start_dns(data_dir: &std::path::Path, bitcoind: &BitcoinD) -> proc
     args.push("--ADDRESS:PORT");
     args.push(&rpc_address);
 
-    let mut directoryd_process = process::Command::new("./target/debug/directoryd")
+    let mut directoryd_process = process::Command::new(env!("CARGO_BIN_EXE_directoryd"))
         .args(args) // THINK: Passing network to avoid mitosis problem..
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
         .spawn()
-        .unwrap();
-
+        .expect("Failed to spawn directoryd process");
     let stderr = directoryd_process.stderr.take().unwrap();
     let stdout = directoryd_process.stdout.take().unwrap();
 
@@ -202,21 +313,15 @@ pub fn fund_and_verify_taker(
 
     let all_utxos = wallet.get_all_utxo().unwrap();
 
-    let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
-
-    let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
-
-    let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-
-    let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
+    let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
     // TODO: Think about this: utxo_count*utxo_amt.
-    assert_eq!(seed_balance, Amount::from_btc(0.15).unwrap());
-    assert_eq!(fidelity_balance, Amount::ZERO);
-    assert_eq!(swapcoin_balance, Amount::ZERO);
-    assert_eq!(live_contract_balance, Amount::ZERO);
+    assert_eq!(balances.regular, Amount::from_btc(0.15).unwrap());
+    assert_eq!(balances.fidelity, Amount::ZERO);
+    assert_eq!(balances.swap, Amount::ZERO);
+    assert_eq!(balances.contract, Amount::ZERO);
 
-    seed_balance + swapcoin_balance
+    balances.spendable
 }
 
 #[allow(dead_code)]
@@ -251,19 +356,13 @@ pub fn fund_and_verify_maker(
 
         let all_utxos = wallet.get_all_utxo().unwrap();
 
-        let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
-
-        let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
-
-        let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-
-        let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
+        let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
         // TODO: Think about this: utxo_count*utxo_amt.
-        assert_eq!(seed_balance, Amount::from_btc(0.20).unwrap());
-        assert_eq!(fidelity_balance, Amount::ZERO);
-        assert_eq!(swapcoin_balance, Amount::ZERO);
-        assert_eq!(live_contract_balance, Amount::ZERO);
+        assert_eq!(balances.regular, Amount::from_btc(0.20).unwrap());
+        assert_eq!(balances.fidelity, Amount::ZERO);
+        assert_eq!(balances.swap, Amount::ZERO);
+        assert_eq!(balances.contract, Amount::ZERO);
     });
 }
 
@@ -279,32 +378,27 @@ pub fn verify_swap_results(
     {
         let wallet = taker.get_wallet();
         let all_utxos = wallet.get_all_utxo().unwrap();
-        let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
-        let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
-        let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-        let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
-
-        let spendable_balance = seed_balance + swapcoin_balance;
+        let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
         assert!(
-            seed_balance == Amount::from_btc(0.14497).unwrap() // Successful coinswap
-                || seed_balance == Amount::from_btc(0.14993232).unwrap() // Recovery via timelock
-                || seed_balance == Amount::from_btc(0.15).unwrap(), // No spending
+            balances.regular == Amount::from_btc(0.14497).unwrap() // Successful coinswap
+                || balances.regular == Amount::from_btc(0.14993232).unwrap() // Recovery via timelock
+                || balances.regular == Amount::from_btc(0.15).unwrap(), // No spending
             "Taker seed balance mismatch"
         );
 
         assert!(
-            swapcoin_balance == Amount::from_btc(0.00438642).unwrap() // Successful coinswap
-                || swapcoin_balance == Amount::ZERO, // Unsuccessful coinswap
+            balances.swap == Amount::from_btc(0.00438642).unwrap() // Successful coinswap
+                || balances.swap == Amount::ZERO, // Unsuccessful coinswap
             "Taker swapcoin balance mismatch"
         );
 
-        assert_eq!(live_contract_balance, Amount::ZERO);
-        assert_eq!(fidelity_balance, Amount::ZERO);
+        assert_eq!(balances.contract, Amount::ZERO);
+        assert_eq!(balances.fidelity, Amount::ZERO);
 
         // Check balance difference
         let balance_diff = org_taker_spend_balance
-            .checked_sub(spendable_balance)
+            .checked_sub(balances.spendable)
             .unwrap();
 
         assert!(
@@ -322,40 +416,35 @@ pub fn verify_swap_results(
         .for_each(|(maker, org_spend_balance)| {
             let wallet = maker.get_wallet().read().unwrap();
             let all_utxos = wallet.get_all_utxo().unwrap();
-            let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
-            let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
-            let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-            let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
-
-            let spendable_balance = seed_balance + swapcoin_balance;
+            let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
             assert!(
-                seed_balance == Amount::from_btc(0.14557358).unwrap() // First maker on successful coinswap
-                    || seed_balance == Amount::from_btc(0.14532500).unwrap() // Second maker on successful coinswap
-                    || seed_balance == Amount::from_btc(0.14999).unwrap() // No spending
-                    || seed_balance == Amount::from_btc(0.14992232).unwrap(), // Recovery via timelock
+                balances.regular == Amount::from_btc(0.14557358).unwrap() // First maker on successful coinswap
+                    || balances.regular == Amount::from_btc(0.14532500).unwrap() // Second maker on successful coinswap
+                    || balances.regular == Amount::from_btc(0.14999).unwrap() // No spending
+                    || balances.regular == Amount::from_btc(0.14992232).unwrap(), // Recovery via timelock
                 "Maker seed balance mismatch"
             );
 
             assert!(
-                swapcoin_balance == Amount::from_btc(0.005).unwrap() // First maker
-                    || swapcoin_balance == Amount::from_btc(0.00463500).unwrap() // Second maker
-                    || swapcoin_balance == Amount::ZERO, // No swap or funding tx missing
+                balances.swap == Amount::from_btc(0.005).unwrap() // First maker
+                    || balances.swap == Amount::from_btc(0.00463500).unwrap() // Second maker
+                    || balances.swap == Amount::ZERO, // No swap or funding tx missing
                 "Maker swapcoin balance mismatch"
             );
 
-            assert_eq!(fidelity_balance, Amount::from_btc(0.05).unwrap());
+            assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
 
             // Live contract balance can be non-zero, if a maker shuts down in middle of recovery.
             assert!(
-                live_contract_balance == Amount::ZERO
-                    || live_contract_balance == Amount::from_btc(0.00460500).unwrap() // For the first maker in hop
-                    || live_contract_balance == Amount::from_btc(0.00435642).unwrap() // For the second maker in hop
+                balances.contract == Amount::ZERO
+                    || balances.contract == Amount::from_btc(0.00460500).unwrap() // For the first maker in hop
+                    || balances.contract == Amount::from_btc(0.00435642).unwrap() // For the second maker in hop
             );
 
             // Check spendable balance difference.
-            let balance_diff = match org_spend_balance.checked_sub(spendable_balance) {
-                None => spendable_balance.checked_sub(*org_spend_balance).unwrap(), // Successful swap as Makers balance increase by Coinswap fee.
+            let balance_diff = match org_spend_balance.checked_sub(balances.spendable) {
+                None => balances.spendable.checked_sub(*org_spend_balance).unwrap(), // Successful swap as Makers balance increase by Coinswap fee.
                 Some(diff) => diff, // No spending or unsuccessful swap
             };
 
@@ -405,9 +494,9 @@ impl TestFramework {
         Arc<DirectoryServer>,
         JoinHandle<()>,
     ) {
-        setup_logger(log::LevelFilter::Info);
         // Setup directory
         let temp_dir = env::temp_dir().join("coinswap");
+        setup_logger(log::LevelFilter::Info, Some(temp_dir.clone()));
         // Remove if previously existing
         if temp_dir.exists() {
             fs::remove_dir_all::<PathBuf>(temp_dir.clone()).unwrap();
@@ -447,6 +536,8 @@ impl TestFramework {
             None,
             Some(taker_rpc_config),
             taker_behavior,
+            None,
+            None,
             Some(connection_type),
         )
         .unwrap();
@@ -467,6 +558,8 @@ impl TestFramework {
                         Some(maker_rpc_config),
                         Some(port.0),
                         Some(base_rpc_port),
+                        None,
+                        None,
                         port.1,
                         Some(connection_type),
                         behavior,

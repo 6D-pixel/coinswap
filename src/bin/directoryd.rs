@@ -35,23 +35,19 @@ struct Cli {
 }
 
 fn main() -> Result<(), DirectoryServerError> {
-    setup_directory_logger(log::LevelFilter::Info);
-
     let args = Cli::parse();
+    setup_directory_logger(log::LevelFilter::Info, args.data_directory.clone());
+
     let rpc_config = RPCConfig {
         url: args.rpc,
         auth: Auth::UserPass(args.auth.0, args.auth.1),
         wallet_name: "random".to_string(), // we can put anything here as it will get updated in the init.
     };
 
-    #[cfg(feature = "tor")]
-    let connection_type = if cfg!(feature = "integration-test") {
-        ConnectionType::CLEARNET
-    } else {
-        ConnectionType::TOR
-    };
+    #[cfg(not(feature = "integration-test"))]
+    let connection_type = ConnectionType::TOR;
 
-    #[cfg(not(feature = "tor"))]
+    #[cfg(feature = "integration-test")]
     let connection_type = ConnectionType::CLEARNET;
 
     let directory = Arc::new(DirectoryServer::new(

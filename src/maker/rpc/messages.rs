@@ -1,11 +1,12 @@
-use std::{collections::HashMap, fmt::Display};
+use std::fmt::Display;
 
 use bitcoin::Txid;
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, to_string_pretty};
 use std::path::PathBuf;
 
-use crate::wallet::FidelityBond;
+use crate::wallet::Balances;
 
 /// Enum representing RPC message requests.
 ///
@@ -23,14 +24,8 @@ pub enum RpcMsgReq {
     ContractUtxo,
     /// Request to fetch UTXOs in the fidelity pool.
     FidelityUtxo,
-    /// Request to retreive the total spenable balance in wallet.
-    Balance,
-    /// Request to retrieve the total swap balance in wallet.
-    SwapBalance,
-    /// Request to retrieve the total balance in the contract pool.
-    ContractBalance,
-    /// Request to retrieve the total balance in the fidelity pool.
-    FidelityBalance,
+    /// Request to retreive the total wallet balances of different categories.
+    Balances,
     /// Request for generating a new wallet address.
     NewAddress,
     /// Request to send funds to a specific address.
@@ -40,7 +35,7 @@ pub enum RpcMsgReq {
         /// The amount to send.
         amount: u64,
         /// The transaction fee to include.
-        fee: u64,
+        feerate: f64,
     },
     /// Request to retrieve the Tor address of the Maker.
     GetTorAddress,
@@ -48,8 +43,14 @@ pub enum RpcMsgReq {
     GetDataDir,
     /// Request to stop the Maker server.
     Stop,
-    /// Request to reddem a fidelity bond for a given index.
-    RedeemFidelity(u32),
+    /// Request to reddem a fidelity bond for a given (index, feerate).
+    RedeemFidelity {
+        /// Index of the fidelity bond
+        index: u32,
+
+        /// Feerate in sats/vByte
+        feerate: f64,
+    },
     /// Request to list all active and past fidelity bonds.
     ListFidelity,
     /// Request to sync the internal wallet with blockchain.
@@ -84,14 +85,8 @@ pub enum RpcMsgResp {
         /// List of UTXOs in the contract pool.
         utxos: Vec<ListUnspentResultEntry>,
     },
-    /// Response containing the total balance in the seed pool.
-    SeedBalanceResp(u64),
-    /// Response containing the total balance in the swap pool.
-    SwapBalanceResp(u64),
-    /// Response containing the total balance in the contract pool.
-    ContractBalanceResp(u64),
-    /// Response containing the total balance in the fidelity pool.
-    FidelityBalanceResp(u64),
+    /// Response containing the total wallet balances of different categories.
+    TotalBalanceResp(Balances),
     /// Response containing a newly generated wallet address.
     NewAddressResp(String),
     /// Response to a send-to-address request.
@@ -107,7 +102,7 @@ pub enum RpcMsgResp {
     /// Response with the internal server error.
     ServerError(String),
     /// Response listing all current and past fidelity bonds.
-    ListBonds(HashMap<u32, (FidelityBond, bool)>),
+    ListBonds(String),
 }
 
 impl Display for RpcMsgResp {
@@ -115,10 +110,20 @@ impl Display for RpcMsgResp {
         match self {
             Self::Pong => write!(f, "Pong"),
             Self::NewAddressResp(addr) => write!(f, "{}", addr),
-            Self::SeedBalanceResp(bal) => write!(f, "{} sats", bal),
-            Self::ContractBalanceResp(bal) => write!(f, "{} sats", bal),
-            Self::SwapBalanceResp(bal) => write!(f, "{} sats", bal),
-            Self::FidelityBalanceResp(bal) => write!(f, "{} sats", bal),
+            Self::TotalBalanceResp(balances) => {
+                write!(
+                    f,
+                    "{}",
+                    to_string_pretty(&json!({
+                        "regular": balances.regular.to_sat(),
+                        "swap": balances.swap.to_sat(),
+                        "contract": balances.contract.to_sat(),
+                        "fidelity": balances.fidelity.to_sat(),
+                        "spendable": balances.spendable.to_sat(),
+                    }))
+                    .unwrap()
+                )
+            }
             Self::UtxoResp { utxos } => write!(f, "{:#?}", utxos),
             Self::SwapUtxoResp { utxos } => write!(f, "{:#?}", utxos),
             Self::FidelityUtxoResp { utxos } => write!(f, "{:#?}", utxos),
@@ -129,7 +134,7 @@ impl Display for RpcMsgResp {
             Self::Shutdown => write!(f, "Shutdown Initiated"),
             Self::FidelitySpend(txid) => write!(f, "{}", txid),
             Self::ServerError(e) => write!(f, "{}", e),
-            Self::ListBonds(v) => write!(f, "{:#?}", v),
+            Self::ListBonds(v) => write!(f, "{}", v),
         }
     }
 }

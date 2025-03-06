@@ -9,9 +9,6 @@ use coinswap::{
 mod test_framework;
 use log::{info, warn};
 use std::{
-    fs::File,
-    io::Read,
-    path::PathBuf,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
     time::Duration,
@@ -93,20 +90,14 @@ fn abort3_case1_close_at_contract_sigs_for_recvr_and_sender() {
             let wallet = maker.wallet.read().unwrap();
             let all_utxos = wallet.get_all_utxo().unwrap();
 
-            let seed_balance = wallet.balance_descriptor_utxo(Some(&all_utxos)).unwrap();
+            let balances = wallet.get_balances(Some(&all_utxos)).unwrap();
 
-            let fidelity_balance = wallet.balance_fidelity_bonds(Some(&all_utxos)).unwrap();
+            assert_eq!(balances.regular, Amount::from_btc(0.14999).unwrap());
+            assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
+            assert_eq!(balances.swap, Amount::ZERO);
+            assert_eq!(balances.contract, Amount::ZERO);
 
-            let swapcoin_balance = wallet.balance_swap_coins(Some(&all_utxos)).unwrap();
-
-            let live_contract_balance = wallet.balance_live_contract(Some(&all_utxos)).unwrap();
-
-            assert_eq!(seed_balance, Amount::from_btc(0.14999).unwrap());
-            assert_eq!(fidelity_balance, Amount::from_btc(0.05).unwrap());
-            assert_eq!(swapcoin_balance, Amount::ZERO);
-            assert_eq!(live_contract_balance, Amount::ZERO);
-
-            seed_balance + swapcoin_balance
+            balances.spendable
         })
         .collect::<Vec<_>>();
 
@@ -193,27 +184,10 @@ fn abort3_case1_close_at_contract_sigs_for_recvr_and_sender() {
     // | **Maker16102** | 3,000                              | 768                 | 3,000              | 6,768                      |
 
     // Maker6102 gets banned for being naughty.
-    match taker.config.connection_type {
-        ConnectionType::CLEARNET => {
-            assert_eq!(
-                format!("127.0.0.1:{}", 6102),
-                taker.get_bad_makers()[0].address.to_string()
-            );
-        }
-        #[cfg(feature = "tor")]
-        ConnectionType::TOR => {
-            let onion_addr_path =
-                PathBuf::from(format!("/tmp/tor-rust-maker{}/hs-dir/hostname", 6102));
-            let mut file = File::open(onion_addr_path).unwrap();
-            let mut onion_addr: String = String::new();
-            file.read_to_string(&mut onion_addr).unwrap();
-            onion_addr.pop();
-            assert_eq!(
-                format!("{}:{}", onion_addr, 6102),
-                taker.get_bad_makers()[0].address.to_string()
-            );
-        }
-    }
+    assert_eq!(
+        format!("127.0.0.1:{}", 6102),
+        taker.get_bad_makers()[0].address.to_string()
+    );
 
     // After Swap checks:
     verify_swap_results(

@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         
       - name: Set default toolchain
-        run: rustup default nightly
+        run: rustup override set nightly
 
       - name: Set profile
         run: rustup set profile minimal

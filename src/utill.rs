@@ -5,8 +5,9 @@ use bitcoin::{
     hashes::Hash,
     key::{rand::thread_rng, Keypair},
     secp256k1::{Message, Secp256k1, SecretKey},
-    Address, PublicKey, ScriptBuf, Transaction, WitnessProgram, WitnessVersion,
+    Address, Amount, PublicKey, ScriptBuf, Transaction, WitnessProgram, WitnessVersion,
 };
+use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use log::LevelFilter;
 use log4rs::{
     append::{console::ConsoleAppender, file::FileAppender},
@@ -15,7 +16,7 @@ use log4rs::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fmt,
+    env, fmt, fs,
     io::{BufReader, BufWriter, ErrorKind, Read},
     net::TcpStream,
     path::{Path, PathBuf},
@@ -25,11 +26,11 @@ use std::{
 
 use std::{
     collections::HashMap,
-    fs::{self, File},
-    io::{self, BufRead, Write},
-    thread,
+    io::{self, Write},
+    sync::OnceLock,
     time::Duration,
 };
+static LOGGER: OnceLock<()> = OnceLock::new();
 
 use crate::{
     error::NetError,
@@ -38,7 +39,7 @@ use crate::{
         error::ProtocolError,
         messages::{FidelityProof, MultisigPrivkey},
     },
-    wallet::{fidelity_redeemscript, FidelityError, SwapCoin, WalletError},
+    wallet::{fidelity_redeemscript, FidelityError, SwapCoin, UTXOSpendInfo, WalletError},
 };
 
 const INPUT_CHARSET: &str =
@@ -61,6 +62,9 @@ pub(crate) const HEART_BEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// Number of confirmation required funding transaction.
 pub const REQUIRED_CONFIRMS: u32 = 1;
 
+/// Default Transaction Fees in sats/vByte
+pub const DEFAULT_TX_FEE_RATE: f64 = 2.0;
+
 /// Specifies the type of connection: TOR or Clearnet.
 ///
 /// This enum is used to distinguish between different types of network connections
@@ -69,7 +73,6 @@ pub enum ConnectionType {
     /// Represents a TOR connection type.
     ///
     /// This variant is only available when the `tor` feature is enabled.
-    #[cfg(feature = "tor")]
     TOR,
 
     /// Represents a Clearnet connection type.
@@ -81,7 +84,6 @@ impl FromStr for ConnectionType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            #[cfg(feature = "tor")]
             "tor" => Ok(ConnectionType::TOR),
             "clearnet" => Ok(ConnectionType::CLEARNET),
             _ => Err(NetError::InvalidAppNetwork),
@@ -92,21 +94,10 @@ impl FromStr for ConnectionType {
 impl fmt::Display for ConnectionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "tor")]
             ConnectionType::TOR => write!(f, "tor"),
             ConnectionType::CLEARNET => write!(f, "clearnet"),
         }
     }
-}
-
-/// Read the tor address given a tor directory path
-pub(crate) fn get_tor_hostname(tor_dir: &Path) -> io::Result<String> {
-    let hostname_file_path = tor_dir.join("hs-dir").join("hostname");
-    let mut hostname_file = File::open(hostname_file_path)?;
-    let mut tor_addrs: String = String::new();
-    hostname_file.read_to_string(&mut tor_addrs)?;
-    tor_addrs.pop(); // Remove `\n` at the end.
-    Ok(tor_addrs)
 }
 
 /// Get the system specific home directory.
@@ -145,25 +136,36 @@ pub(crate) fn get_dns_dir() -> PathBuf {
 /// the console and a file. It sets the `RUST_LOG` environment variable to provide default
 /// log levels and configures log4rs with the specified filter level for fine-grained control
 /// of log verbosity.
-pub fn setup_taker_logger(filter: LevelFilter) {
-    Once::new().call_once(|| {
-        //env::set_var("RUST_LOG", "coinswap=info");
-        let log_dir = get_taker_dir().join("debug.log");
+pub fn setup_taker_logger(filter: LevelFilter, is_stdout: bool, datadir: Option<PathBuf>) {
+    LOGGER.get_or_init(|| {
+        let log_dir = datadir.unwrap_or_else(get_taker_dir).join("debug.log");
 
         let file_appender = FileAppender::builder().build(log_dir).unwrap();
+        let stdout = ConsoleAppender::builder().build();
 
-        let config = Config::builder()
-            .appender(Appender::builder().build("file", Box::new(file_appender)))
-            .logger(
-                Logger::builder()
-                    .appender("file")
-                    .build("coinswap::taker", filter),
-            )
-            .build(Root::builder().appender("file").build(filter))
-            .unwrap();
+        let config =
+            Config::builder().appender(Appender::builder().build("file", Box::new(file_appender)));
 
+        let config = if is_stdout {
+            config.appender(Appender::builder().build("stdout", Box::new(stdout)))
+            //.logger(Logger::builder().appender("stdout").build("stdout", filter))
+        } else {
+            config
+        };
+
+        // Add appenders to the root logger
+        let root_logger = if is_stdout {
+            Root::builder()
+                .appender("file")
+                .appender("stdout")
+                .build(filter)
+        } else {
+            Root::builder().appender("file").build(filter)
+        };
+
+        let config = config.build(root_logger).unwrap();
         log4rs::init_config(config).unwrap();
-    })
+    });
 }
 
 /// Sets up the logger for the maker component.
@@ -172,10 +174,9 @@ pub fn setup_taker_logger(filter: LevelFilter) {
 /// the console and a file. It sets the `RUST_LOG` environment variable to provide default
 /// log levels and configures log4rs with the specified filter level for fine-grained control
 /// of log verbosity.
-pub fn setup_maker_logger(filter: LevelFilter) {
-    Once::new().call_once(|| {
-        //env::set_var("RUST_LOG", "coinswap=info");
-        let log_dir = get_maker_dir().join("debug.log");
+pub fn setup_maker_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
+    LOGGER.get_or_init(|| {
+        let log_dir = data_dir.unwrap_or_else(get_maker_dir).join("debug.log");
 
         let stdout = ConsoleAppender::builder().build();
         let file_appender = FileAppender::builder().build(log_dir).unwrap();
@@ -192,7 +193,7 @@ pub fn setup_maker_logger(filter: LevelFilter) {
             .unwrap();
 
         log4rs::init_config(config).unwrap();
-    })
+    });
 }
 
 /// Sets up the logger for the directory component.
@@ -201,10 +202,9 @@ pub fn setup_maker_logger(filter: LevelFilter) {
 /// the console and a file. It sets the `RUST_LOG` environment variable to provide default
 /// log levels and configures log4rs with the specified filter level for fine-grained control
 /// of log verbosity.
-pub fn setup_directory_logger(filter: LevelFilter) {
-    Once::new().call_once(|| {
-        //env::set_var("RUST_LOG", "coinswap=info");
-        let log_dir = get_dns_dir().join("debug.log");
+pub fn setup_directory_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
+    LOGGER.get_or_init(|| {
+        let log_dir = data_dir.unwrap_or_else(get_dns_dir).join("debug.log");
 
         let stdout = ConsoleAppender::builder().build();
         let file_appender = FileAppender::builder().build(log_dir).unwrap();
@@ -221,45 +221,17 @@ pub fn setup_directory_logger(filter: LevelFilter) {
             .unwrap();
 
         log4rs::init_config(config).unwrap();
-    })
+    });
 }
 
 /// Setup function that will only run once, even if called multiple times.
 /// Takes log level to set the desired logging verbosity
-pub fn setup_logger(filter: LevelFilter) {
+pub fn setup_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
     Once::new().call_once(|| {
         env::set_var("RUST_LOG", "coinswap=info");
-        let taker_log_dir = get_taker_dir().join("debug.log");
-        let maker_log_dir = get_maker_dir().join("debug.log");
-        let directory_log_dir = get_dns_dir().join("debug.log");
-
-        let stdout = ConsoleAppender::builder().build();
-        let taker = FileAppender::builder().build(taker_log_dir).unwrap();
-        let maker = FileAppender::builder().build(maker_log_dir).unwrap();
-        let directory = FileAppender::builder().build(directory_log_dir).unwrap();
-        let config = Config::builder()
-            .appender(Appender::builder().build("stdout", Box::new(stdout)))
-            .appender(Appender::builder().build("taker", Box::new(taker)))
-            .appender(Appender::builder().build("maker", Box::new(maker)))
-            .appender(Appender::builder().build("directory", Box::new(directory)))
-            .logger(
-                Logger::builder()
-                    .appender("taker")
-                    .build("coinswap::taker", filter),
-            )
-            .logger(
-                Logger::builder()
-                    .appender("maker")
-                    .build("coinswap::maker", log::LevelFilter::Info),
-            )
-            .logger(
-                Logger::builder()
-                    .appender("directory")
-                    .build("coinswap::market", log::LevelFilter::Info),
-            )
-            .build(Root::builder().appender("stdout").build(filter))
-            .unwrap();
-        log4rs::init_config(config).unwrap();
+        setup_taker_logger(filter, true, data_dir.as_ref().map(|d| d.join("taker")));
+        setup_maker_logger(filter, data_dir.as_ref().map(|d| d.join("maker")));
+        setup_directory_logger(filter, data_dir.as_ref().map(|d| d.join("directory")));
     });
 }
 
@@ -431,39 +403,6 @@ pub(crate) fn parse_field<T: std::str::FromStr>(value: Option<&String>, default:
         .unwrap_or(default)
 }
 
-/// Function to check if tor log contains a pattern
-pub(crate) fn monitor_log_for_completion(log_file: &Path, pattern: &str) -> io::Result<()> {
-    // TODO: Make this logic work for existing file with previous logs.
-    let mut last_size = 0;
-
-    loop {
-        if log_file.exists() {
-            let file = File::open(log_file)?;
-            let metadata = file.metadata()?;
-            let current_size = metadata.len();
-
-            if current_size != last_size {
-                let reader = io::BufReader::new(file);
-                let lines = reader.lines();
-
-                for line in lines {
-                    if let Ok(line) = line {
-                        log::info!("{}", line);
-                        if line.contains(pattern) {
-                            return Ok(());
-                        }
-                    } else {
-                        return Err(io::Error::new(io::ErrorKind::Other, "Error reading line"));
-                    }
-                }
-
-                last_size = current_size;
-            }
-        }
-        thread::sleep(HEART_BEAT_INTERVAL);
-    }
-}
-
 fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
     let upper_bits = checksum >> SHIFT_FOR_C0;
     checksum = ((checksum & MASK_LOW_35_BITS) << 5) ^ value;
@@ -483,6 +422,33 @@ fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
     }
 
     checksum
+}
+
+/// Represents basic UTXO details, useful for pretty printing in the apps.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UTXO {
+    addr: String,
+    amount: Amount,
+    confirmations: u32,
+    utxo_type: String,
+}
+
+impl UTXO {
+    /// Creates an UTXO from detailed internal utxo data
+    pub fn from_utxo_data(data: (ListUnspentResultEntry, UTXOSpendInfo)) -> Self {
+        let addr = data
+            .0
+            .address
+            .expect("address always expected")
+            .assume_checked()
+            .to_string();
+        Self {
+            addr,
+            amount: data.0.amount,
+            confirmations: data.0.confirmations,
+            utxo_type: data.1.to_string(),
+        }
+    }
 }
 
 /// Compute the checksum of a descriptor
@@ -582,7 +548,10 @@ pub(crate) fn verify_fidelity_checks(
     }
 
     // Verify certificate hash
-    let expected_cert_hash = proof.bond.generate_cert_hash(addr);
+    let expected_cert_hash = proof
+        .bond
+        .generate_cert_hash(addr)
+        .expect("Bond is not yet confirmed");
     if proof.cert_hash != expected_cert_hash {
         return Err(FidelityError::InvalidCertHash.into());
     }
@@ -590,7 +559,6 @@ pub(crate) fn verify_fidelity_checks(
     let networks = vec![
         bitcoin::network::Network::Regtest,
         bitcoin::network::Network::Testnet,
-        bitcoin::network::Network::Testnet4,
         bitcoin::network::Network::Bitcoin,
         bitcoin::network::Network::Signet,
     ];
@@ -627,9 +595,66 @@ pub(crate) fn verify_fidelity_checks(
     Ok(())
 }
 
+/// Tor Error grades
+#[derive(Debug)]
+pub enum TorError {
+    /// Io error
+    IO(std::io::Error),
+    /// Generic error
+    General(String),
+}
+
+impl From<std::io::Error> for TorError {
+    fn from(value: std::io::Error) -> Self {
+        TorError::IO(value)
+    }
+}
+
+pub(crate) fn check_tor_status(control_port: u16, password: &str) -> Result<(), TorError> {
+    use std::io::BufRead;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", control_port))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let auth_command = format!("AUTHENTICATE \"{}\"\r\n", password);
+    stream.write_all(auth_command.as_bytes())?;
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    if !response.starts_with("250") {
+        log::error!(
+            "Tor authentication failed: {}, please provide correct password",
+            response
+        );
+        return Err(TorError::General("Tor authentication failed".to_string()));
+    }
+    stream.write_all(b"GETINFO status/bootstrap-phase\r\n")?;
+    response.clear();
+    reader.read_line(&mut response)?;
+
+    if response.contains("PROGRESS=100") {
+        log::info!("Tor is fully started and operational!");
+    } else {
+        log::warn!("Tor is still starting, try again later: {}", response);
+    }
+    Ok(())
+}
+
+pub(crate) fn get_tor_hostname() -> Result<String, TorError> {
+    let path = if cfg!(target_os = "macos") {
+        "/opt/homebrew/var/lib/tor/coinswap/hostname"
+    } else {
+        "/var/lib/tor/coinswap/hostname"
+    };
+
+    let hostname = fs::read_to_string(path)?;
+    let hostname = hostname.trim().to_string();
+
+    log::info!("Tor Hidden Service Hostname: {}", hostname);
+
+    Ok(hostname)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
+    use std::{net::TcpListener, thread};
 
     use bitcoin::{
         blockdata::{opcodes::all, script::Builder},
